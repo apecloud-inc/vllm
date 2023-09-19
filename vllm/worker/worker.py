@@ -14,6 +14,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.sequence import SequenceData, SequenceGroupMetadata, SequenceOutputs
 from vllm.worker.cache_engine import CacheEngine
 from vllm.utils import get_gpu_memory
+import time 
 
 
 class Worker:
@@ -261,6 +262,8 @@ class Worker:
         blocks_to_swap_out: Dict[int, int],
         blocks_to_copy: Dict[int, List[int]],
     ) -> Dict[int, SequenceOutputs]:
+        torch.cuda.synchronize()
+        start = time.time()
         # Issue cache operations.
         issued_cache_op = False
         if blocks_to_swap_in:
@@ -288,7 +291,12 @@ class Worker:
         # Prepare input tensors.
         input_tokens, input_positions, input_metadata = self._prepare_inputs(
             seq_group_metadata_list)
+        torch.cuda.synchronize()
+        end = time.time()
+        print("prepare time: ", f"{end-start} s")
 
+        torch.cuda.synchronize()
+        start = time.time()
         # Execute the model.
         output = self.model(
             input_ids=input_tokens,
@@ -297,6 +305,9 @@ class Worker:
             input_metadata=input_metadata,
             cache_events=cache_events,
         )
+        torch.cuda.synchronize()
+        end = time.time()
+        print("execute model time: ", f"{end-start} s")
         return output
 
 

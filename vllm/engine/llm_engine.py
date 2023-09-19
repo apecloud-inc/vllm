@@ -413,7 +413,9 @@ class LLMEngine:
                     f"Swapped: {len(self.scheduler.swapped)} reqs, "
                     f"Pending: {len(self.scheduler.waiting)} reqs, "
                     f"GPU KV cache usage: {gpu_cache_usage * 100:.1f}%, "
-                    f"CPU KV cache usage: {cpu_cache_usage * 100:.1f}%")
+                    f"CPU KV cache usage: {cpu_cache_usage * 100:.1f}%, "
+                    f"total_num_gpu_blocks: {total_num_gpu_blocks}, "
+                    f"num_free_gpu_blocks: {num_free_gpu_blocks}")
         self.last_logging_time = now
 
     def _decode_sequences(self, seq_groups: List[SequenceGroup]) -> None:
@@ -423,6 +425,7 @@ class LLMEngine:
                 new_token, new_output_text = detokenize_incrementally(
                     self.tokenizer,
                     seq.output_tokens,
+                    seq.output_text,
                     seq.get_last_token_id(),
                     skip_special_tokens=True,
                 )

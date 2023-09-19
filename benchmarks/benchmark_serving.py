@@ -46,7 +46,7 @@ def sample_requests(
     ]
     # Only keep the first two turns of each conversation.
     dataset = [
-        (data["conversations"][0]["value"], data["conversations"][1]["value"])
+        (data["conversations"][0]["value"], data["conversations"][1]["value"]) if data["conversations"][0]["from"] == "human" else (data["conversations"][1]["value"], data["conversations"][0]["value"])
         for data in dataset
     ]
 
@@ -75,7 +75,12 @@ def sample_requests(
         filtered_dataset.append((prompt, prompt_len, output_len))
 
     # Sample the requests.
-    sampled_requests = random.sample(filtered_dataset, num_requests)
+    # sampled_requests = random.sample(filtered_dataset, num_requests)
+    # sampled_requests = filtered_dataset[:num_requests]
+    print(filtered_dataset[0])
+    sampled_requests = []
+    for i in range(num_requests): 
+        sampled_requests.append(filtered_dataset[0])
     return sampled_requests
 
 
@@ -202,6 +207,24 @@ def main(args: argparse.Namespace):
     ])
     print("Average latency per output token: "
           f"{avg_per_output_token_latency:.2f} s")
+    max_latency = np.max([
+        latency 
+        for prompt_len, output_len, latency in REQUEST_LATENCY
+    ])
+    print("max latency: "
+          f"{max_latency:.2f} s")
+    min_latency = np.min([
+        latency 
+        for prompt_len, output_len, latency in REQUEST_LATENCY
+    ])
+    print("min latency: "
+          f"{min_latency:.2f} s")
+    a = np.array([
+        latency 
+        for prompt_len, output_len, latency in REQUEST_LATENCY
+    ])
+    top_min_latency = a[(a).argsort()]
+    print("top min latency: ", top_min_latency)
 
 
 if __name__ == "__main__":
