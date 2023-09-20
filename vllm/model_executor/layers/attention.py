@@ -73,7 +73,12 @@ class PagedAttention(nn.Module):
             raise ValueError(f"head_size ({self.head_size}) is not supported. "
                              f"Supported head sizes: {_SUPPORTED_HEAD_SIZES}.")
 
-    def set_attn_bias(self, input_metadata: InputMetadata) -> None:
+    def set_attn_bias(
+        self,
+        input_metadata: InputMetadata,
+        dtype: torch.dtype,
+    ) -> None:
+        del dtype  # Unused.
         if input_metadata.attn_bias:
             # Already set by a previous layer.
             return
@@ -196,7 +201,7 @@ class PagedAttention(nn.Module):
         if num_prompt_tokens > 0:
             # Prompt run.
             assert input_metadata.num_generation_tokens == 0
-            self.set_attn_bias(input_metadata)
+            self.set_attn_bias(input_metadata, dtype=query.dtype)
             self.multi_query_kv_attention(
                 output[:num_prompt_tokens],
                 query[:num_prompt_tokens],
@@ -242,7 +247,7 @@ class PagedAttention(nn.Module):
 
 
 class PagedAttentionWithRoPE(PagedAttention):
-    """PagedAttention with GPT-NeoX style rotary embedding."""
+    """PagedAttention with rotary embedding."""
 
     def __init__(
         self,
@@ -253,13 +258,16 @@ class PagedAttentionWithRoPE(PagedAttention):
         max_position: int = 8192,
         base: int = 10000,
         num_kv_heads: Optional[int] = None,
+        is_neox_style: bool = True,
     ) -> None:
         super().__init__(num_heads, head_size, scale, num_kv_heads)
+        self.is_neox_style = is_neox_style
 
         # Create the cos and sin cache.
-        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2) / rotary_dim))
-        t = torch.arange(max_position).float()
-        freqs = torch.einsum("i,j -> ij", t, inv_freq.float())
+        inv_freq = 1.0 / (base**(torch.arange(
+            0, rotary_dim, 2, dtype=torch.float, device="cuda") / rotary_dim))
+        t = torch.arange(max_position, dtype=torch.float, device="cuda")
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
         sin = freqs.sin()
         cache = torch.cat((cos, sin), dim=-1)
@@ -303,12 +311,13 @@ class PagedAttentionWithRoPE(PagedAttention):
 
         # Apply rotary embedding to the query and key before passing them
         # to the attention op.
-        pos_encoding_ops.rotary_embedding_neox(
+        pos_encoding_ops.rotary_embedding(
             positions,
             query,
             key,
             self.head_size,
             self.cos_sin_cache,
+            self.is_neox_style,
         )
         return super().forward(
             query,
@@ -336,13 +345,14 @@ class PagedAttentionWithALiBi(PagedAttention):
         slopes = torch.tensor(slopes, dtype=torch.float32)
         self.register_buffer("alibi_slopes", slopes, persistent=False)
 
-    def set_attn_bias(self, input_metadata: InputMetadata) -> None:
+    def set_attn_bias(self, input_metadata: InputMetadata,
+                      dtype: torch.dtype) -> None:
         if input_metadata.attn_bias:
             # Already set by a previous layer.
             return
         # Generates ALiBi mask for each prompt.
         for prompt_len in input_metadata.prompt_lens:
-            bias = torch.arange(prompt_len)
+            bias = torch.arange(prompt_len, dtype=dtype)
             # Note(zhuohan): HF uses
             #     `bias = bias[None, :].repeat(prompt_len, 1)`
             # here. We find that both biases give the same results, but
@@ -360,6 +370,7 @@ class PagedAttentionWithALiBi(PagedAttention):
                 prompt_len,
                 padded_len,
                 device=self.alibi_slopes.device,
+                dtype=dtype,
             )[:, :, :, :prompt_len].copy_(bias)
             bias.mul_(self.alibi_slopes[:, None, None])
             attn_bias = LowerTriangularMaskWithTensorBias(bias)
