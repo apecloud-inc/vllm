@@ -11,6 +11,9 @@ from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.sampling_params import SamplingParams
 from vllm.utils import random_uuid
 
+from typing import List
+from transformers.generation.utils import GenerationConfig
+
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 TIMEOUT_TO_PREVENT_DEADLOCK = 1  # seconds.
 app = FastAPI()
@@ -62,6 +65,76 @@ async def generate(request: Request) -> Response:
     ret = {"text": text_outputs}
     return JSONResponse(ret)
 
+# only support baichuan
+@app.post("/chat")
+async def chat(request: Request) -> Response: 
+    tokenizer = engine.engine.tokenizer
+    if tokenizer.__class__.__name__ != "BaichuanTokenizer": 
+        ret = {"err": "chat not support in model {}".format(engine.engine.model_config.model)}
+        return JSONResponse(ret)
+    request_dict = await request.json()
+    prompt = request_dict.pop("prompt")
+    messages = []
+    messages.append({"role": "user", "content": prompt})
+    input_ids = baichuan_chat(tokenizer, messages)
+    sampling_params = SamplingParams(**request_dict)
+    request_id = random_uuid()
+    results_generator = engine.generate(None, sampling_params, request_id, input_ids)
+    final_output = None
+    async for request_output in results_generator:
+        if await request.is_disconnected():
+            # Abort the request if the client disconnects.
+            await engine.abort(request_id)
+            return Response(status_code=499)
+        final_output = request_output
+    outputs = final_output.outputs
+    print(outputs)
+    # response = tokenizer.decode(outputs[0].token_ids, skip_special_tokens=True)
+    ret = {"text": outputs[0].text}
+    return JSONResponse(ret)
+
+def baichuan_chat(tokenizer, messages: List[dict]): 
+    print(messages)
+    generation_config = GenerationConfig.from_pretrained(
+        engine.engine.model_config.model,
+    )
+    print(generation_config)
+    max_new_tokens = generation_config.max_new_tokens
+    print(tokenizer)
+    max_input_tokens = tokenizer.model_max_length - max_new_tokens
+    max_input_tokens = max(tokenizer.model_max_length // 2, max_input_tokens)
+    total_input, round_input = [], []
+    for i, message in enumerate(messages[::-1]):
+        content_tokens = tokenizer.encode(message["content"])
+        if message["role"] == "user":
+            round_input = (
+                [generation_config.user_token_id]
+                + content_tokens
+                + round_input
+            )
+            if (
+                total_input
+                and len(total_input) + len(round_input) > max_input_tokens
+            ):
+                break
+            else:
+                total_input = round_input + total_input
+                if len(total_input) >= max_input_tokens:
+                    break
+                else:
+                    round_input = []
+        elif message["role"] == "assistant":
+            round_input = (
+                [generation_config.assistant_token_id]
+                + content_tokens
+                + [generation_config.eos_token_id]
+                + round_input
+            )
+        else:
+            raise ValueError(f"message role not supported yet: {message['role']}")
+    total_input = total_input[-max_input_tokens:]  # truncate left
+    total_input.append(generation_config.assistant_token_id)
+    return total_input
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
