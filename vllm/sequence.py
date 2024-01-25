@@ -4,7 +4,12 @@ import enum
 from typing import Dict, List, Optional, Union
 
 from vllm.block import LogicalTokenBlock
+from vllm.prefix import Prefix
 from vllm.sampling_params import SamplingParams
+from vllm.lora.request import LoRARequest
+
+PromptLogprobs = List[Optional[Dict[int, float]]]
+SampleLogprobs = List[Dict[int, float]]
 
 
 class SequenceStatus(enum.Enum):
@@ -102,6 +107,7 @@ class Sequence:
         prompt_token_ids: The token IDs of the prompt.
         block_size: The block size of the sequence. Should be the same as the
             block size used by the block manager and cache engine.
+        lora_request: LoRA request.
     """
 
     def __init__(
@@ -110,13 +116,15 @@ class Sequence:
         prompt: str,
         prompt_token_ids: List[int],
         block_size: int,
+        lora_request: Optional[LoRARequest] = None,
     ) -> None:
         self.seq_id = seq_id
         self.prompt = prompt
         self.block_size = block_size
+        self.lora_request = lora_request
 
         self.data = SequenceData(prompt_token_ids)
-        self.output_logprobs: List[Dict[int, float]] = []
+        self.output_logprobs: SampleLogprobs = []
         self.output_text = ""
 
         self.logical_token_blocks: List[LogicalTokenBlock] = []
@@ -129,6 +137,10 @@ class Sequence:
         self.read_offset = 0
         # Input + output tokens
         self.tokens: Optional[List[str]] = None
+
+    @property
+    def lora_int_id(self) -> int:
+        return self.lora_request.lora_int_id if self.lora_request else 0
 
     def _append_logical_block(self) -> None:
         block = LogicalTokenBlock(
@@ -196,7 +208,7 @@ class Sequence:
         """
         if seq_len is None:
             seq_len = self.get_len()
-            # Note: HF implementation does not count the EOS token
+            # NOTE: HF implementation does not count the EOS token
             # towards the length, we align with that here for testing.
             if (eos_token_id is not None
                     and self.get_last_token_id() == eos_token_id):
@@ -225,6 +237,8 @@ class SequenceGroup:
         seqs: The list of sequences.
         sampling_params: The sampling parameters used to generate the outputs.
         arrival_time: The arrival time of the request.
+        lora_request: LoRA request.
+        prefix: The prefix of the prompt of the sequence group.
     """
 
     def __init__(
@@ -233,11 +247,32 @@ class SequenceGroup:
         seqs: List[Sequence],
         sampling_params: SamplingParams,
         arrival_time: float,
+        lora_request: Optional[LoRARequest] = None,
+        prefix: Optional[Prefix] = None,
     ) -> None:
         self.request_id = request_id
         self.seqs_dict = {seq.seq_id: seq for seq in seqs}
         self.sampling_params = sampling_params
         self.arrival_time = arrival_time
+        self.lora_request = lora_request
+        self.prefix: Optional[Prefix] = prefix
+        self.prompt_logprobs: Optional[PromptLogprobs] = None
+
+    @property
+    def prompt(self) -> str:
+        # All sequences in the group should have the same prompt.
+        # We use the prompt of an arbitrary sequence.
+        return next(iter(self.seqs_dict.values())).prompt
+
+    @property
+    def prompt_token_ids(self) -> List[int]:
+        # All sequences in the group should have the same prompt.
+        # We use the prompt of an arbitrary sequence.
+        return next(iter(self.seqs_dict.values())).data.prompt_token_ids
+
+    @property
+    def lora_int_id(self) -> int:
+        return self.lora_request.lora_int_id if self.lora_request else 0
 
     def get_max_num_running_seqs(self) -> int:
         """The maximum number of sequences running in parallel in the remaining
@@ -311,7 +346,6 @@ class SequenceGroup:
 class SequenceGroupMetadata:
     """Metadata for a sequence group. Used to create `InputMetadata`.
 
-
     Args:
         request_id: The ID of the request.
         is_prompt: Whether the request is at prompt stage.
@@ -319,6 +353,8 @@ class SequenceGroupMetadata:
         sampling_params: The sampling parameters used to generate the outputs.
         block_tables: The block tables. (Seq id -> list of physical block
             numbers)
+        lora_request: LoRA request.
+        prefix: The prefix of the prompt of the sequence group.
     """
 
     def __init__(
@@ -328,15 +364,23 @@ class SequenceGroupMetadata:
         seq_data: Dict[int, SequenceData],
         sampling_params: SamplingParams,
         block_tables: Dict[int, List[int]],
+        lora_request: Optional[LoRARequest] = None,
+        prefix: Optional[Prefix] = None,
     ) -> None:
         self.request_id = request_id
         self.is_prompt = is_prompt
         self.seq_data = seq_data
         self.sampling_params = sampling_params
         self.block_tables = block_tables
+        self.lora_request = lora_request
+        self.prefix = prefix
+
+    @property
+    def lora_int_id(self) -> int:
+        return self.lora_request.lora_int_id if self.lora_request else 0
 
 
-class SequenceOutputs:
+class SequenceOutput:
     """The model output associated with a sequence.
 
     Args:
@@ -358,18 +402,40 @@ class SequenceOutputs:
         self.logprobs = logprobs
 
     def __repr__(self) -> str:
-        return (f"SequenceOutputs(parent_seq_id={self.parent_seq_id}, "
+        return (f"SequenceOutput(parent_seq_id={self.parent_seq_id}, "
                 f"output_token={self.output_token}, "
                 f"logprobs={self.logprobs})")
 
     def __eq__(self, other: object) -> bool:
-        if not isinstance(other, SequenceOutputs):
+        if not isinstance(other, SequenceOutput):
             raise NotImplementedError()
         return (self.parent_seq_id == other.parent_seq_id
                 and self.output_token == other.output_token
                 and self.logprobs == other.logprobs)
 
 
-# For each sequence group, we generate a list of SequenceOutputs object,
+class SequenceGroupOutput:
+    """The model output associated with a sequence group."""
+
+    def __init__(
+        self,
+        samples: List[SequenceOutput],
+        prompt_logprobs: Optional[PromptLogprobs],
+    ) -> None:
+        self.samples = samples
+        self.prompt_logprobs = prompt_logprobs
+
+    def __repr__(self) -> str:
+        return (f"SequenceGroupOutput(samples={self.samples}, "
+                f"prompt_logprobs={self.prompt_logprobs})")
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SequenceGroupOutput):
+            raise NotImplementedError()
+        return (self.samples == other.samples
+                and self.prompt_logprobs == other.prompt_logprobs)
+
+
+# For each sequence group, we generate a list of SequenceOutput object,
 # each of which contains one possible candidate for the next token.
-SamplerOutput = List[List[SequenceOutputs]]
+SamplerOutput = List[SequenceGroupOutput]
